@@ -25,9 +25,18 @@ import RxSwift
 import RxCocoa
 import Kingfisher
 
+func cachedFileUrl(_ fileName: String) -> URL {
+    return FileManager.default.urls(for: .cachesDirectory, in: .allDomainsMask).first!.appendingPathComponent(fileName)
+}
+
 class ActivityController: UITableViewController {
     
     private let repo = "ReactiveX/RxSwift"
+    
+    private let eventsFileUrl = cachedFileUrl("events.plist")
+    private let modifiedFileUrl = cachedFileUrl("modified.txt")
+    
+    private let lastModified = Variable<NSString?>(nil)
     
     private let events = Variable<[Event]>([])
     private let bag = DisposeBag()
@@ -44,6 +53,11 @@ class ActivityController: UITableViewController {
         refreshControl.attributedTitle = NSAttributedString(string: "Pull to refresh")
         refreshControl.addTarget(self, action: #selector(refresh), for: .valueChanged)
         
+        let eventsArray = (NSArray(contentsOf: eventsFileUrl) as? [[String: Any]]) ?? []
+        events.value = eventsArray.flatMap(Event.init)
+        
+        lastModified.value = try? NSString(contentsOf: modifiedFileUrl, usedEncoding: nil)
+        
         refresh()
     }
     
@@ -59,8 +73,13 @@ class ActivityController: UITableViewController {
             .map { urlString -> URL in
                 return URL(string: "https://api.github.com/repos/\(urlString)/events")!
             }
-            .map { url -> URLRequest in
-                return URLRequest(url: url)
+            .map { [weak self] url -> URLRequest in
+                var request = URLRequest(url: url)
+                if let modifiedHeader = self?.lastModified.value {
+                    request.addValue(modifiedHeader as String, forHTTPHeaderField: "Last-Modified")
+                }
+                return request
+
             }
             .flatMap { request -> Observable<(response: HTTPURLResponse, data: Data)> in
                 return URLSession.shared.rx.response(request: request)
@@ -80,15 +99,45 @@ class ActivityController: UITableViewController {
             .filter { objects in
                 return objects.count > 0
             }.map { objects in
-                return objects.map(Event.init)
+                //O flat map do swift remove todos os Events que resultarem em nil no init
+                return objects.flatMap(Event.init)
             }
             .subscribe(onNext: { [weak self] newEvents in
                 self?.processEvents(newEvents)
             }).disposed(by: bag)
+        
+        response
+            .filter{ response, _ in
+                return 200..<400 ~= response.statusCode
+            }
+            .flatMap { response, _ -> Observable<NSString> in
+                guard let value = response.allHeaderFields["Last-Modified"] as? NSString else {
+                    return Observable.empty()
+                }
+                return Observable.just(value)
+            }
+            .subscribe(onNext: { [weak self] modifiedHeader in
+                guard let strongSelf = self else {return}
+                strongSelf.lastModified.value = modifiedHeader
+                try? modifiedHeader.write(to: strongSelf.modifiedFileUrl, atomically: true, encoding: String.Encoding.utf8.rawValue)
+            }).disposed(by: bag)
     }
     
     func processEvents(_ newEvents: [Event]) {
+        var updateEvents = newEvents + events.value
         
+        if updateEvents.count > 50 {
+            updateEvents = Array<Event>(updateEvents.prefix(upTo: 50))
+        }
+        events.value = updateEvents
+        
+        DispatchQueue.main.async {
+            self.tableView.reloadData()
+            self.refreshControl?.endRefreshing()
+        }
+        
+        let eventsArray = updateEvents.map {events in events.dictionary} as NSArray
+        eventsArray.write(to: eventsFileUrl, atomically: true)
     }
     
     // MARK: - Table Data Source
